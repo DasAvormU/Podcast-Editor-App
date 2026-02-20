@@ -1,22 +1,16 @@
 # ==========================================
-# REENACTMENT PODCAST BACKEND (Maschinenraum)
+# REENACTMENT PODCAST BACKEND (Fast Mode)
 # ==========================================
-# Dieses Skript nimmt Audios entgegen, normalisiert sie,
-# schneidet Pausen heraus und fügt Intro/Outro hinzu.
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from pydub import AudioSegment
-from pydub.silence import split_on_silence
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import os
 import shutil
 
-# 1. System-Initialisierung (Die Schnittstelle öffnen)
-app = FastAPI(title="Podcast Generator API")
+app = FastAPI(title="Podcast Generator API (Fast Mode)")
 
-# Erlaubt dem Frontend (React), mit diesem Backend zu kommunizieren
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,49 +19,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Hilfs-Routinen (Die Werkzeuge)
 def normalize_audio(audio_segment: AudioSegment, target_dBFS=-20.0):
-    """
-    Gleicht die Lautstärke der Tonspur an (Normalisierung).
-    Verhindert, dass eine Person sehr leise und die andere sehr laut ist.
-    """
+    """Gleicht die Lautstärke der Tonspur an (Normalisierung)."""
     change_in_dBFS = target_dBFS - audio_segment.dBFS
     return audio_segment.apply_gain(change_in_dBFS)
 
-def remove_silence(audio_segment: AudioSegment):
-    """
-    KI/Algorithmus-Filter: Erkennt Stille (Pausen, Atmer) und schneidet sie heraus.
-    """
-    # Teilt das Audio, wenn es länger als 500ms leiser als -40dB ist
-    chunks = split_on_silence(
-        audio_segment,
-        min_silence_len=500,
-        silence_thresh=-40
-    )
-    
-    # Fügt die nützlichen Teile mit einer kurzen, natürlichen Pause (100ms) wieder zusammen
-    processed_audio = AudioSegment.empty()
-    for chunk in chunks:
-        processed_audio += chunk + AudioSegment.silent(duration=100)
-        
-    # Fallback, falls das Audio komplett still war
-    if len(processed_audio) == 0:
-        return audio_segment
-        
-    return processed_audio
-
-# 3. Der Haupt-Prozess (Der Endpunkt)
 @app.post("/generate-podcast/")
 async def create_podcast(
     intro: UploadFile = File(...),
     outro: UploadFile = File(...),
     segments: list[UploadFile] = File(...)
 ):
-    """
-    Diese Funktion wird aufgerufen, wenn Dateien hochgeladen werden.
-    Sie führt die gesamte Transformation durch.
-    """
-    # Wir erstellen einen temporären Ordner auf dem Computer, um die Dateien kurz abzulegen
     temp_dir = tempfile.mkdtemp()
     output_path = os.path.join(temp_dir, "final_podcast.mp3")
 
@@ -78,24 +40,18 @@ async def create_podcast(
             shutil.copyfileobj(intro.file, buffer)
         final_audio = AudioSegment.from_file(intro_path)
         
-        # --- SCHRITT 2: Segmente (WhatsApp) sortieren und verarbeiten ---
-        # Sortiert die hochgeladenen Dateien nach ihrem Dateinamen (z.B. WhatsApp-Zeitstempel)
+        # --- SCHRITT 2: Segmente sortieren und normalisieren ---
         sorted_segments = sorted(segments, key=lambda x: x.filename)
-        
         for segment in sorted_segments:
             seg_path = os.path.join(temp_dir, segment.filename)
             with open(seg_path, "wb") as buffer:
                 shutil.copyfileobj(segment.file, buffer)
                 
-            # Audio in den Arbeitsspeicher laden
             raw_audio = AudioSegment.from_file(seg_path)
             
-            # Filter anwenden: Lautstärke anpassen & Pausen entfernen
+            # KOMPLEXITÄTSREDUKTION: Nur noch Normalisierung, kein Pausenschnitt!
             normalized_audio = normalize_audio(raw_audio)
-            cleaned_audio = remove_silence(normalized_audio)
-            
-            # An den Podcast anhängen
-            final_audio += cleaned_audio
+            final_audio += normalized_audio
             
         # --- SCHRITT 3: Outro anhängen ---
         outro_path = os.path.join(temp_dir, outro.filename)
@@ -103,16 +59,9 @@ async def create_podcast(
             shutil.copyfileobj(outro.file, buffer)
         final_audio += AudioSegment.from_file(outro_path)
         
-        # --- SCHRITT 4: Überprüfung der Zeitvorgabe (10-14 Minuten) ---
-        duration_seconds = len(final_audio) / 1000.0
-        if duration_seconds > 840: # 840 Sekunden = 14 Minuten
-            print(f"WARNUNG: Podcast ist {duration_seconds/60:.2f} Minuten lang. Split empfohlen.")
-            # Hier könnte in einer erweiterten Version der automatische Cut stattfinden.
-
-        # --- SCHRITT 5: Export als MP3 ---
+        # --- SCHRITT 4: Export als MP3 ---
         final_audio.export(output_path, format="mp3", bitrate="192k")
         
-        # Datei an den Nutzer zurücksenden
         return FileResponse(
             path=output_path, 
             filename="Reenactment_Podcast_Episode.mp3", 

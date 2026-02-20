@@ -1,16 +1,20 @@
 # ==========================================
-# REENACTMENT PODCAST BACKEND (Fast Mode)
+# REENACTMENT PODCAST BACKEND (Low Memory Mode)
 # ==========================================
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
-from pydub import AudioSegment
-from fastapi.middleware.cors import CORSMiddleware
+# Nutzt direkt FFmpeg auf der Festplatte, um RAM-Abstürze
+# auf kostenlosen Servern (512MB Limit) zu verhindern.
+
+import subprocess
 import tempfile
 import os
 import shutil
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Podcast Generator API (Fast Mode)")
+app = FastAPI(title="Podcast Generator API (Low Memory)")
 
+# Erlaubt dem Frontend, mit diesem Backend zu kommunizieren
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,10 +23,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def normalize_audio(audio_segment: AudioSegment, target_dBFS=-20.0):
-    """Gleicht die Lautstärke der Tonspur an (Normalisierung)."""
-    change_in_dBFS = target_dBFS - audio_segment.dBFS
-    return audio_segment.apply_gain(change_in_dBFS)
+def normalize_audio_ffmpeg(input_path, output_path):
+    """
+    Normalisiert die Lautstärke ressourcenschonend direkt auf der Festplatte.
+    Verhindert, dass der Arbeitsspeicher (RAM) belastet wird.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-filter:a", "loudnorm",
+        "-c:a", "libmp3lame", "-b:a", "128k",
+        output_path
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 @app.post("/generate-podcast/")
 async def create_podcast(
@@ -30,43 +42,59 @@ async def create_podcast(
     outro: UploadFile = File(...),
     segments: list[UploadFile] = File(...)
 ):
+    # Erstellt einen sicheren, temporären Ordner auf der Festplatte
     temp_dir = tempfile.mkdtemp()
-    output_path = os.path.join(temp_dir, "final_podcast.mp3")
+    final_output = os.path.join(temp_dir, "final_podcast.mp3")
+    concat_list_path = os.path.join(temp_dir, "concat.txt")
 
     try:
-        # --- SCHRITT 1: Intro laden ---
-        intro_path = os.path.join(temp_dir, intro.filename)
-        with open(intro_path, "wb") as buffer:
-            shutil.copyfileobj(intro.file, buffer)
-        final_audio = AudioSegment.from_file(intro_path)
-        
-        # --- SCHRITT 2: Segmente sortieren und normalisieren ---
-        sorted_segments = sorted(segments, key=lambda x: x.filename)
-        for segment in sorted_segments:
-            seg_path = os.path.join(temp_dir, segment.filename)
-            with open(seg_path, "wb") as buffer:
-                shutil.copyfileobj(segment.file, buffer)
+        processed_files = []
+
+        # Hilfs-Routine: Datei speichern und ohne RAM-Belastung normalisieren
+        def process_file(upload_file, prefix):
+            raw_path = os.path.join(temp_dir, f"raw_{prefix}_{upload_file.filename}")
+            norm_path = os.path.join(temp_dir, f"norm_{prefix}.mp3")
+            
+            with open(raw_path, "wb") as buffer:
+                shutil.copyfileobj(upload_file.file, buffer)
                 
-            raw_audio = AudioSegment.from_file(seg_path)
-            
-            # KOMPLEXITÄTSREDUKTION: Nur noch Normalisierung, kein Pausenschnitt!
-            normalized_audio = normalize_audio(raw_audio)
-            final_audio += normalized_audio
-            
-        # --- SCHRITT 3: Outro anhängen ---
-        outro_path = os.path.join(temp_dir, outro.filename)
-        with open(outro_path, "wb") as buffer:
-            shutil.copyfileobj(outro.file, buffer)
-        final_audio += AudioSegment.from_file(outro_path)
+            normalize_audio_ffmpeg(raw_path, norm_path)
+            return norm_path
+
+        # --- SCHRITT 1 & 2: Jingles & Segmente laden und anpassen ---
+        processed_files.append(process_file(intro, "intro"))
         
-        # --- SCHRITT 4: Export als MP3 ---
-        final_audio.export(output_path, format="mp3", bitrate="192k")
-        
+        # Chronologische Sortierung der WhatsApp-Dateien
+        sorted_segments = sorted(segments, key=lambda x: x.filename)
+        for idx, seg in enumerate(sorted_segments):
+            processed_files.append(process_file(seg, f"seg_{idx}"))
+            
+        processed_files.append(process_file(outro, "outro"))
+
+        # --- SCHRITT 3: Effizientes Zusammenfügen (Concat ohne Re-Encoding) ---
+        # Erstellt eine Textdatei mit allen Schnipseln als Bauplan für FFmpeg
+        with open(concat_list_path, "w") as f:
+            for pf in processed_files:
+                safe_path = pf.replace('\\', '/')
+                f.write(f"file '{safe_path}'\n")
+
+        # FFmpeg klebt die Dateien in Sekunden auf der Festplatte zusammen (nahezu 0 RAM!)
+        concat_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy", 
+            final_output
+        ]
+        subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        # Liefert die fertige Datei an die App zurück
         return FileResponse(
-            path=output_path, 
+            path=final_output, 
             filename="Reenactment_Podcast_Episode.mp3", 
             media_type="audio/mpeg"
         )
 
+    except subprocess.CalledProcessError:
+        raise HTTPException(status_code=500, detail="Audio-Motor (FFmpeg) Fehler. Datei eventuell beschädigt.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fehler bei der Verarbeitung: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Systemfehler: {str(e)}")
